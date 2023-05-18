@@ -1,14 +1,17 @@
-use b64_url::{b64_url_encode_with_config, B64Config, B64ConfigPadding};
-use bytes::{BufMut, Bytes, BytesMut};
-use hmac::{Hmac, Mac};
+use b64_url::{
+    B64Config, B64ConfigPadding, _b64_url_encode_calculate_destination_capacity,
+    _b64_url_encode_with_config,
+};
+use bytes::Bytes;
 use lazy_static::lazy_static;
-use sha2::Sha256;
 
 pub mod header;
 pub mod payload;
+pub mod signer;
 
-use header::{Header, SigningAlgorithm};
+use header::Header;
 use payload::Payload;
+use signer::Signer;
 
 lazy_static! {
     static ref B64_CONFIG: B64Config = B64Config {
@@ -23,93 +26,82 @@ pub struct Jwt {
     pub header_bytes: Bytes,
     pub payload: Payload,
     pub payload_bytes: Bytes,
-    pub signature: String,
+    pub signature: Vec<u8>,
     pub signature_bytes: Bytes,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct JwtBuilder {
     pub payload: Payload,
 }
 
 impl JwtBuilder {
-    pub fn build(&self, signer: &Signer) -> Jwt {
+    pub fn build(self, signer: &Signer) -> Jwt {
         let signer = signer.clone();
 
-        let (header, header_string) = signer.get_jwt_header();
+        let header = signer.header();
+        let header_json = serde_json::to_string(&header).unwrap();
+        let payload_json = serde_json::to_string(&self.payload).unwrap();
 
-        let payload_string = String::from_utf8(b64_url_encode_with_config(
-            serde_json::to_string(&self.payload).unwrap().as_bytes(),
-            &B64_CONFIG,
-        ))
-        .unwrap();
-
-        let signature_string = signer.get_jwt_signature(&header_string, &payload_string);
-
-        let mut cursor = 0;
-        let mut buffer = BytesMut::with_capacity(
-            header_string.len() + payload_string.len() + signature_string.len() + 2,
+        let mut buffer = Vec::<u8>::with_capacity(
+            _b64_url_encode_calculate_destination_capacity(header_json.len())
+                + _b64_url_encode_calculate_destination_capacity(payload_json.len())
+                + _b64_url_encode_calculate_destination_capacity(signer.signature_length())
+                + 2,
         );
-        buffer.put(header_string.as_bytes());
-        let header_indexes = (cursor, cursor + header_string.len());
-        buffer.put(".".as_bytes());
-        cursor += header_string.len() + 1;
-        buffer.put(payload_string.as_bytes());
-        let payload_indexes = (cursor, cursor + payload_string.len());
-        buffer.put(".".as_bytes());
-        cursor += payload_string.len() + 1;
-        buffer.put(signature_string.as_bytes());
-        let signature_indexes = (cursor, cursor + signature_string.len());
-        let bytes = buffer.freeze();
 
-        let header_bytes = bytes.slice(header_indexes.0..header_indexes.1);
-        let payload_bytes = bytes.slice(payload_indexes.0..payload_indexes.1);
-        let signature_bytes = bytes.slice(signature_indexes.0..signature_indexes.1);
+        let header_num_bytes;
+        let payload_num_bytes;
+        let signature_num_bytes;
+        let mut destination_ptr = buffer.as_mut_ptr();
+        unsafe {
+            header_num_bytes = _b64_url_encode_with_config(
+                header_json.as_ptr(),
+                header_json.len(),
+                destination_ptr,
+                &B64_CONFIG,
+            );
+            destination_ptr = destination_ptr.add(header_num_bytes + 1);
+            payload_num_bytes = _b64_url_encode_with_config(
+                payload_json.as_ptr(),
+                payload_json.len(),
+                destination_ptr,
+                &B64_CONFIG,
+            );
+            buffer.set_len(header_num_bytes + payload_num_bytes + 1);
+        }
+        buffer[header_num_bytes] = 0x2e;
+
+        let signature = signer.signature(buffer.as_slice());
+        unsafe {
+            destination_ptr = destination_ptr.add(payload_num_bytes + 1);
+            signature_num_bytes = _b64_url_encode_with_config(
+                signature.as_ptr(),
+                signature.len(),
+                destination_ptr,
+                &B64_CONFIG,
+            );
+            buffer.set_len(header_num_bytes + payload_num_bytes + signature_num_bytes + 2);
+        }
+        buffer[header_num_bytes + payload_num_bytes + 1] = 0x2e;
+
+        let bytes = Bytes::from(buffer);
+        let header_bytes = bytes.slice(0..header_num_bytes);
+        let payload_bytes =
+            bytes.slice((header_num_bytes + 1)..(header_num_bytes + payload_num_bytes + 1));
+        let signature_bytes = bytes.slice(
+            (header_num_bytes + payload_num_bytes + 2)
+                ..(header_num_bytes + payload_num_bytes + signature_num_bytes + 2),
+        );
 
         Jwt {
             bytes,
             header,
             header_bytes,
-            payload: self.payload.clone(),
+            payload: self.payload,
             payload_bytes,
-            signature: signature_string.clone(),
+            signature,
             signature_bytes,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub enum Signer {
-    HmacSha256(Hmac<Sha256>),
-}
-
-impl Signer {
-    pub fn get_jwt_header(&self) -> (Header, String) {
-        match self {
-            Signer::HmacSha256(_) => {
-                let header = Header {
-                    algorithm: SigningAlgorithm::HS256,
-                    r#type: Some("JWT".into()),
-                };
-                let header_string = String::from_utf8(b64_url_encode_with_config(
-                    serde_json::to_string(&header).unwrap().as_bytes(),
-                    &B64_CONFIG,
-                ))
-                .unwrap();
-                (header, header_string)
-            }
-        }
-    }
-
-    pub fn get_jwt_signature(self, header_string: &String, payload_string: &String) -> String {
-        match self {
-            Signer::HmacSha256(mut signer) => {
-                signer.update(header_string.as_bytes());
-                signer.update(b".");
-                signer.update(payload_string.as_bytes());
-                let result = signer.finalize().into_bytes();
-                String::from_utf8(b64_url_encode_with_config(&result, &B64_CONFIG)).unwrap()
-            }
         }
     }
 }
@@ -118,6 +110,8 @@ impl Signer {
 mod jwt_builder_tests {
     use super::*;
     use bytes::Bytes;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
 
     #[test]
     fn new() {
